@@ -234,7 +234,7 @@ void AndroidRuntime::start(const char* className, const Vector<String8>& options
 }
 ```
 
-##### #### 5.Zygote进程
+####  5.Zygote进程
 
 ZygoteInit.java中的main函数是Zygote进程的入口，在这里会启动Zygote服务，加载资源，并且为fork application处理相关的任务和准备进程
 
@@ -417,7 +417,7 @@ static void preload(TimingsTraceLog bootTimingsTraceLog) {
 
 ##### 5.4 开启Zygote进程中消息循环
 
-通过5.3小节的分析，我们知道当返回null时，表示此时在Zygote进程自身中，那么将会执行`caller = zygoteServer.runSelectLoop(abiList);`
+通过5.3小节的分析，我们知道当返回null时，表示此时在Zygote进程自身中，那么将会执行`caller = zygoteServer.runSelectLoop(abiList);`，进行消息循环
 
 ```java
     Runnable runSelectLoop(String abiList) {
@@ -451,38 +451,30 @@ static void preload(TimingsTraceLog bootTimingsTraceLog) {
                     if ((pollFDs[pollIndex].revents & POLLIN) == 0) {
                         continue;
                     }
-
                     if (pollIndex == 0) {
-						//pollIndex为0，表示是ZygoteSocket
+						//pollIndex为0，表示是建立连接
                         ZygoteConnection newPeer = acceptCommandPeer(abiList);
                         peers.add(newPeer);
                         //添加到socketFDs中
                         socketFDs.add(newPeer.getFileDescriptor());
 
                     } else if (pollIndex < usapPoolEventFDIndex) {
-                        // Session socket accepted from the Zygote server socket
-
+                       	//大于0小于usapPoolEventFDIndex是进行数据请求
                         try {
                             ZygoteConnection connection = peers.get(pollIndex);
+                            //在processOneCommand中创建新进程
                             final Runnable command = connection.processOneCommand(this);
                             if (mIsForkChild) {
-                                // We're in the child. We should always have a command to run at
-                                // this stage if processOneCommand hasn't called "exec".
+                                //处于子进程中
                                 if (command == null) {
                                     throw new IllegalStateException("command == null");
                                 }
-
                                 return command;
                             } else {
-                                // We're in the server - we should never have any commands to run.
+                                //处于父进程中
                                 if (command != null) {
                                     throw new IllegalStateException("command != null");
                                 }
-
-                                // We don't know whether the remote side of the socket was closed or
-                                // not until we attempt to read from it from processOneCommand. This
-                                // shows up as a regular POLLIN event in our regular processing
-                                // loop.
                                 if (connection.isClosedByPeer()) {
                                     connection.closeSocket();
                                     peers.remove(pollIndex);
@@ -490,115 +482,204 @@ static void preload(TimingsTraceLog bootTimingsTraceLog) {
                                 }
                             }
                         } catch (Exception e) {
-                            if (!mIsForkChild) {
-                                // We're in the server so any exception here is one that has taken
-                                // place pre-fork while processing commands or reading / writing
-                                // from the control socket. Make a loud noise about any such
-                                // exceptions so that we know exactly what failed and why.
+	
+                          ....
+    }
+```
 
-                                Slog.e(TAG, "Exception executing zygote command: ", e);
+#### 6.SystemServer进程
 
-                                // Make sure the socket is closed so that the other end knows
-                                // immediately that something has gone wrong and doesn't time out
-                                // waiting for a response.
-                                ZygoteConnection conn = peers.remove(pollIndex);
-                                conn.closeSocket();
+```java
+    public static void main(String[] args) {
+        new SystemServer().run();
+    }
 
-                                socketFDs.remove(pollIndex);
-                            } else {
-                                // We're in the child so any exception caught here has happened post
-                                // fork and before we execute ActivityThread.main (or any other
-                                // main() method). Log the details of the exception and bring down
-                                // the process.
-                                Log.e(TAG, "Caught post-fork exception in child process.", e);
-                                throw e;
-                            }
-                        } finally {
-                            // Reset the child flag, in the event that the child process is a child-
-                            // zygote. The flag will not be consulted this loop pass after the
-                            // Runnable is returned.
-                            mIsForkChild = false;
-                        }
+```
 
-                    } else {
-                        // Either the USAP pool event FD or a USAP reporting pipe.
+```java
+    private void run() {
+   			...
+   			//变更虚拟机的库文件，
+            SystemProperties.set("persist.sys.dalvik.vm.lib.2", VMRuntime.getRuntime().vmLibrary());
 
-                        // If this is the event FD the payload will be the number of USAPs removed.
-                        // If this is a reporting pipe FD the payload will be the PID of the USAP
-                        // that was just specialized.  The `continue` statements below ensure that
-                        // the messagePayload will always be valid if we complete the try block
-                        // without an exception.
-                        long messagePayload;
+            //清楚vm内存增长上限，由于启动过程需要较多的虚拟机内存空间
+            VMRuntime.getRuntime().clearGrowthLimit();
 
-                        try {
-                            byte[] buffer = new byte[Zygote.USAP_MANAGEMENT_MESSAGE_BYTES];
-                            int readBytes =
-                                    Os.read(pollFDs[pollIndex].fd, buffer, 0, buffer.length);
+            // 部分设备依赖于运行时生成指纹，因此在引导前就定义好了
+            Build.ensureFingerprintProperty();
 
-                            if (readBytes == Zygote.USAP_MANAGEMENT_MESSAGE_BYTES) {
-                                DataInputStream inputStream =
-                                        new DataInputStream(new ByteArrayInputStream(buffer));
+			//访问环境变量需要明确指定用户
+            Environment.setUserRequired(true);
 
-                                messagePayload = inputStream.readLong();
-                            } else {
-                                Log.e(TAG, "Incomplete read from USAP management FD of size "
-                                        + readBytes);
-                                continue;
-                            }
-                        } catch (Exception ex) {
-                            if (pollIndex == usapPoolEventFDIndex) {
-                                Log.e(TAG, "Failed to read from USAP pool event FD: "
-                                        + ex.getMessage());
-                            } else {
-                                Log.e(TAG, "Failed to read from USAP reporting pipe: "
-                                        + ex.getMessage());
-                            }
+            BaseBundle.setShouldDefuse(true);
 
-                            continue;
-                        }
+            // 在SystemServer中，当发生异常，要写入堆栈跟踪
+            Parcel.setStackTraceParceling(true);
 
-                        if (pollIndex > usapPoolEventFDIndex) {
-                            Zygote.removeUsapTableEntry((int) messagePayload);
-                        }
+            //确保系统对Binder的调用都以前台优先级运行
+            BinderInternal.disableBackgroundScheduling(true);
 
-                        usapPoolFDRead = true;
-                    }
-                }
+            //设置Binder线程最大数量
+            BinderInternal.setMaxThreads(sMaxBinderThreads);
 
-                if (usapPoolFDRead) {
-                    int usapPoolCount = Zygote.getUsapPoolCount();
+            // 主线程Looper就在当前线程运行
+            android.os.Process.setThreadPriority(
+                    android.os.Process.THREAD_PRIORITY_FOREGROUND);
+            android.os.Process.setCanSelfBackground(false);
+            Looper.prepareMainLooper();
+            Looper.getMainLooper().setSlowLogThresholdMs(
+                    SLOW_DISPATCH_THRESHOLD_MS, SLOW_DELIVERY_THRESHOLD_MS);
 
-                    if (usapPoolCount < mUsapPoolSizeMin) {
-                        // Immediate refill
-                        mUsapPoolRefillAction = UsapPoolRefillAction.IMMEDIATE;
-                    } else if (mUsapPoolSizeMax - usapPoolCount >= mUsapPoolRefillThreshold) {
-                        // Delayed refill
-                        mUsapPoolRefillTriggerTimestamp = System.currentTimeMillis();
-                    }
-                }
+            //加载android_server.so库，源码在frameworks/base/services
+            System.loadLibrary("android_servers");
+
+            // Debug builds - allow heap profiling.
+            if (Build.IS_DEBUGGABLE) {
+                initZygoteChildHeapProfiling();
             }
 
-            if (mUsapPoolRefillAction != UsapPoolRefillAction.NONE) {
-                int[] sessionSocketRawFDs =
-                        socketFDs.subList(1, socketFDs.size())
-                                .stream()
-                                .mapToInt(FileDescriptor::getInt$)
-                                .toArray();
+            // Debug builds - spawn a thread to monitor for fd leaks.
+            if (Build.IS_DEBUGGABLE) {
+                spawnFdLeakCheckThread();
+            }
 
-                final boolean isPriorityRefill =
-                        mUsapPoolRefillAction == UsapPoolRefillAction.IMMEDIATE;
+            // 检查上次关机过程是否失败
+            performPendingShutdown();
 
-                final Runnable command =
-                        fillUsapPool(sessionSocketRawFDs, isPriorityRefill);
+            // 初始化系统上下文
+            createSystemContext();
 
-                if (command != null) {
-                    return command;
-                } else if (isPriorityRefill) {
-                    // Schedule a delayed refill to finish refilling the pool.
-                    mUsapPoolRefillTriggerTimestamp = System.currentTimeMillis();
-                }
+            // 创建SystemServiceManager
+            mSystemServiceManager = new SystemServiceManager(mSystemContext);
+            mSystemServiceManager.setStartInfo(mRuntimeRestart,
+                    mRuntimeStartElapsedTime, mRuntimeStartUptime);
+            //将mSystemServiceManager添加到本地服务的集合中
+            LocalServices.addService(SystemServiceManager.class, mSystemServiceManager);
+            //准备好一个线程池，用于初始化任务
+            SystemServerInitThreadPool.get();
+            // Attach JVMTI agent if this is a debuggable build and the system property is set.
+           ...
+        //启动系统各种服务
+        try {
+            traceBeginAndSlog("StartServices");
+            startBootstrapServices();
+            startCoreServices();
+            startOtherServices();
+            //关闭线程池
+            SystemServerInitThreadPool.shutdown();
+        } catch (Throwable ex) {
+            Slog.e("System", "******************************************");
+            Slog.e("System", "************ Failure starting system services", ex);
+            throw ex;
+        } finally {
+            traceEnd();
+        }
+		...
+
+        //开启Loop循环
+        Looper.loop();
+        throw new RuntimeException("Main thread loop unexpectedly exited");
+    }
+
+```
+
+在startOtherServices开启全部的服务后，在该方法的末尾，就会调用ActivityManagerService的systemready方法
+
+#### 7.启动Launcher页
+
+```java
+ //ActivityManagerService
+public void systemReady(final Runnable goingCallback, TimingsTraceLog traceLog) {
+
+           	...
+            if (bootingSystemUser) {
+                //开启系统主页
+                mAtmInternal.startHomeOnAllDisplays(currentUserId, "systemReady");
+            }
+  }
+
+```
+
+
+
+```java
+//ActivityTaskManagerService
+        @Override
+        public boolean startHomeOnAllDisplays(int userId, String reason) {
+            synchronized (mGlobalLock) {
+                return mRootActivityContainer.startHomeOnAllDisplays(userId, reason);
             }
         }
+
+```
+
+```java
+//RootActivityContainer   
+boolean startHomeOnAllDisplays(int userId, String reason) {
+        boolean homeStarted = false;
+        for (int i = mActivityDisplays.size() - 1; i >= 0; i--) {
+            final int displayId = mActivityDisplays.get(i).mDisplayId;
+            homeStarted |= startHomeOnDisplay(userId, reason, displayId);
+        }
+        return homeStarted;
     }
+
+```
+
+```java
+    boolean startHomeOnDisplay(int userId, String reason, int displayId, boolean allowInstrumenting,
+            boolean fromHomeKey) {
+        // Fallback to top focused display if the displayId is invalid.
+        if (displayId == INVALID_DISPLAY) {
+            displayId = getTopDisplayFocusedStack().mDisplayId;
+        }
+
+        Intent homeIntent = null;
+        ActivityInfo aInfo = null;
+        if (displayId == DEFAULT_DISPLAY) {
+            //启动Home Activity的intent
+            homeIntent = mService.getHomeIntent();
+            aInfo = resolveHomeActivity(userId, homeIntent);
+        } else if (shouldPlaceSecondaryHomeOnDisplay(displayId)) {
+            Pair<ActivityInfo, Intent> info = resolveSecondaryHomeActivity(userId, displayId);
+            aInfo = info.first;
+            homeIntent = info.second;
+        }
+		...
+        //启动Home Activity
+        mService.getActivityStartController().startHomeActivity(homeIntent, aInfo, myReason,
+                displayId);
+     
+```
+
+
+
+```java
+
+    void startHomeActivity(Intent intent, ActivityInfo aInfo, String reason, int displayId) {
+        final ActivityOptions options = ActivityOptions.makeBasic();
+        options.setLaunchWindowingMode(WINDOWING_MODE_FULLSCREEN);
+        if (!ActivityRecord.isResolverActivity(aInfo.name)) {
+            // The resolver activity shouldn't be put in home stack because when the foreground is
+            // standard type activity, the resolver activity should be put on the top of current
+            // foreground instead of bring home stack to front.
+            options.setLaunchActivityType(ACTIVITY_TYPE_HOME);
+        }
+        options.setLaunchDisplayId(displayId);
+        mLastHomeActivityStartResult = obtainStarter(intent, "startHomeActivity: " + reason)
+                .setOutActivity(tmpOutRecord)
+                .setCallingUid(0)
+                .setActivityInfo(aInfo)
+                .setActivityOptions(options.toBundle())
+                .execute();
+        mLastHomeActivityStartRecord = tmpOutRecord[0];
+        final ActivityDisplay display =
+                mService.mRootActivityContainer.getActivityDisplay(displayId);
+        final ActivityStack homeStack = display != null ? display.getHomeStack() : null;
+        if (homeStack != null && homeStack.mInResumeTopActivity) {
+            mSupervisor.scheduleResumeTopActivities();
+        }
+    }
+
 ```
 
