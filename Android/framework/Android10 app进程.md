@@ -165,7 +165,7 @@ public static void main(String[] args) {
 
 
 ```java
-   @GuardedBy("this")
+   
     private final boolean attachApplicationLocked(IApplicationThread thread,
             int pid, int callingUid, long startSeq) {
         //1.获得ProcessRecord
@@ -511,3 +511,94 @@ getFactory得到一个AppComponentFactory对象，然后调用它的instantiateA
 ```
 
 ProcessRecord中的thread字段，记录着app进程作为远程服务端时提供的Binder代理对象
+
+#### 2.4 启动Activity
+
+在AMS的attachApplicationLocked方法中，在创建Application并且调用它的生命周期方法，以及记录下app进程的ApplicationThread后，接下来会做什么呢？
+
+我们看到attachApplicationLocked下面的代码：
+
+```java
+ private final boolean attachApplicationLocked(IApplicationThread thread,
+            int pid, int callingUid, long startSeq) {
+  
+  // See if the top visible activity is waiting to run in this process...
+        if (normalMode) {
+            try {
+                didSomething = mAtmInternal.attachApplication(app.getWindowProcessController());
+            } catch (Exception e) {
+                Slog.wtf(TAG, "Exception thrown launching activities in " + app, e);
+                badApp = true;
+            }
+        }
+
+        // Find any services that should be running in this process...
+        if (!badApp) {
+            try {
+                didSomething |= mServices.attachApplicationLocked(app, processName);
+                checkTime(startTime, "attachApplicationLocked: after mServices.attachApplicationLocked");
+            } catch (Exception e) {
+                Slog.wtf(TAG, "Exception thrown starting services in " + app, e);
+                badApp = true;
+            }
+        }
+
+        // Check if a next-broadcast receiver is in this process...
+        if (!badApp && isPendingBroadcastProcessLocked(pid)) {
+            try {
+                didSomething |= sendPendingBroadcastsLocked(app);
+                checkTime(startTime, "attachApplicationLocked: after sendPendingBroadcastsLocked");
+            } catch (Exception e) {
+                // If the app died trying to launch the receiver we declare it 'bad'
+                Slog.wtf(TAG, "Exception thrown dispatching broadcasts in " + app, e);
+                badApp = true;
+            }
+        }
+
+        // Check whether the next backup agent is in this process...
+        if (!badApp && backupTarget != null && backupTarget.app == app) {
+            if (DEBUG_BACKUP) Slog.v(TAG_BACKUP,
+                    "New app is backup target, launching agent for " + app);
+            notifyPackageUse(backupTarget.appInfo.packageName,
+                             PackageManager.NOTIFY_PACKAGE_USE_BACKUP);
+            try {
+                thread.scheduleCreateBackupAgent(backupTarget.appInfo,
+                        compatibilityInfoForPackage(backupTarget.appInfo),
+                        backupTarget.backupMode, backupTarget.userId);
+            } catch (Exception e) {
+                Slog.wtf(TAG, "Exception thrown creating backup agent in " + app, e);
+                badApp = true;
+            }
+        }
+
+        if (badApp) {
+            app.kill("error during init", true);
+            handleAppDiedLocked(app, false, true);
+            return false;
+        }
+
+        if (!didSomething) {
+            updateOomAdjLocked(OomAdjuster.OOM_ADJ_REASON_PROCESS_BEGIN);
+            checkTime(startTime, "attachApplicationLocked: after updateOomAdjLocked");
+        }
+
+        return true;
+    }
+```
+
+
+
+##### 2.4.1 mAtmInternal.attachApplication
+
+mAtmInternal的类型是ActivityTaskManagerInternal，它是一个抽象类，具体的实现是ActivityTaskManagerService.LocalService。这里首先调用了它的attachApplication方法：
+
+```java
+        public boolean attachApplication(WindowProcessController wpc) throws RemoteException {
+            synchronized (mGlobalLockWithoutBoost) {
+                return mRootActivityContainer.attachApplication(wpc);
+            }
+        }
+```
+
+
+
