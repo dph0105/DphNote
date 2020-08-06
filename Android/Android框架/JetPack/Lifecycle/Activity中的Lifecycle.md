@@ -166,4 +166,3 @@ Fragment_onResume
 ```
 
 如果使用androidx包下的FragmentManager，那么会先调用Fragment的onStart，然后调用Activity的onStart。
-
