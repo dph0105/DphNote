@@ -1522,6 +1522,7 @@ public void execute(ClientTransaction transaction) {
                     r.mPendingRemoveWindowManager = null;
                 }
                 appContext.setOuterContext(activity);
+                //调用attach方法，做的事情就是new一个PhoneWindow，并关联WindowManager
                 activity.attach(appContext, this, getInstrumentation(), r.token,
                         r.ident, app, r.intent, r.activityInfo, title, r.parent,
                         r.embeddedID, r.lastNonConfigurationInstances, config,

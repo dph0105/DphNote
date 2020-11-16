@@ -1,0 +1,41 @@
+View的显示是以Activity为载体的，Activity是在`ActivityThread`的`performLaunchActivity`中进行创建的，在创建完成之后会调用它的attach方法，这个方法做的就是new一个PhoneWindow，并设置了Activity的WindowManager，实际上是WindowManagerImpl对象。然后会调用Activity的onCreate方法，我们在这个方法中调用setContentView设置布局文件，它会创建Activity最顶层的DecorView，并将布局文件加载到它的一个id为R.id.content的FrameLayout中。
+
+然后会执行handleResumeActivity，这个方法会调用WindowManagerImpl的addView方法，传入DecorView。它的实际实现是WindowManagerGlobal的addView方法，WindowManagerGlobal的addView方法会创建ViewRootImpl，并将DecorView和DecorView加入自身维护的集合中进行管理。然后会调用ViewRootImpl的setView方法，它会调用DecorView的assignParent方法将ViewRootImpl设置为Parent，并且它也会调用ViewRootImpl的requestLayout方法。
+
+requestLayout方法首先会在checkThread中检查是否是主线程，然后调用scheduleTraversals方法。scheduleTraversals方法会设置同步屏障，然后通过Choreographer在下一帧到来时执行doTraversal方法。在doTraversal中调用performTraversal进行View的绘制流程，即调用performMeasure、performLayout、performDraw。
+
+首先要测量DecorView的宽高的MeasureSpec，然后执行performMeasure流程。它会调用DecorView的measure方法，然后把参数传递给onMeasure方法。由于DecorView是一个FrameLayout，作为一个ViewGroup，都会遍历子View并调用子View的measure，层层递归调用到了每个子View的onMeasure方法进行测量。
+
+第二步是执行performLayout的过程，它会调用DecorView的layout方法，即便利子View调用其layout方法。
+
+第三步也类似。。
+
+最终完成绘制
+
+当我们调用view的requestlayout方法时，会设置当前View的标志位
+
+```
+mPrivateFlags |= PFLAG_FORCE_LAYOUT;
+mPrivateFlags |= PFLAG_INVALIDATED;
+```
+
+然后调用View的Parent的requestLayout，最终会来到ViewRootImpl的requestLayout方法当中。即首先checkThread检查主线程，然后会调用scheduleTraversals中，最终走performMeasure、performLayout、performDraw。
+
+在View的measure方法中，会判断是否有标志位PFLAG_FORCE_LAYOUT，有则会重新测量，然后设置标志位 `PFLAG_LAYOUT_REQUIRED`
+
+在layout中，判断是否有该标志位，则进入onLayout
+
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
