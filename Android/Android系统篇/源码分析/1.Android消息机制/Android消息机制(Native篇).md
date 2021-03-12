@@ -1,245 +1,20 @@
-### 一、Android消息机制介绍
+### 简介
 
-Android的消息机制是Android的一个重要的功能，它属于进程内部的一种通信方式。利用Android消息机制我们可以做到的功能主要有：1. 任务的延迟执行 2. 将任务放在其他线程执行而不是当前线程（即线程与线程的通信）
+Android消息机制Java层的角色有Looper、MessageQueue等，Native层也有相应的Looper、NativeMessageQueue。这里的MessageQueue与NativeMessageQueue是维系Java层和Native层的纽带，是相关联的，而Looper并没有关联。
 
-主要涉及到的 **Handler 、 Looper 、MessageQueue 、 Message** 这几个类。
-
-- Handler：处理者，用于消息的发送（sendMessage）以及处理（handleMessage）
-- Looper： 循环者，Java线程在执行完它的run方法后就会死亡，而Looper可以使线程存活，它实际上是一个死循环，不断的从MessageQueue中取出Message，并发送给相应的Handler
-- MessageQueue：消息队列，内部存储了一组消息，以队列的形式对外提供向消息池投递消息(enqueueMessage)和取走消息(next)的工作，内部采用单链表的数据结构来存储消息列表。
-- Message：消息。
-
-消息机制的整体流程如图：
-
-![](/imgs/Android消息机制流程图.webp)
-
-
-
-```java
-    class LooperThread extends Thread{
-        Handler mHandler;
-        @Override
-        public void run() {
-            //创建Looper
-            Looper.prepare();
-            mHandler = new Handler(){
-                @Override
-                public void handleMessage(@NonNull Message msg) {
-                    super.handleMessage(msg);
-                }
-            };
-            //开启消息循环
-            Looper.loop();
-        }
-    }
-```
-
-
+我们在分析消息机制Java篇时，发现只有MessageQueue中调用了若干native方法，我们逐一分析。
 
 ### 二、源码分析
 
-#### Handler#init
+MessageQueue的构造方法中会通过JNI调用native层的android_os_MessageQueue_nativeInit方法进行初始化，获取NativeMessageQueue的地址
 
 ```java
-    public Handler() {
-        this(null, false);
-    }
-    
-    public Handler(Callback callback, boolean async) {
-		...
-        mLooper = Looper.myLooper();
-        if (mLooper == null) {
-            throw new RuntimeException(
-                "Can't create handler inside thread " + Thread.currentThread()
-                        + " that has not called Looper.prepare()");
-        }
-        mQueue = mLooper.mQueue;
-        mCallback = callback;
-        mAsynchronous = async;
-    }
+MessageQueue(boolean quitAllowed) {
+    mQuitAllowed = quitAllowed;
+    mPtr = nativeInit();
+}
 ```
 
-Handler的构造器中，首先会判断Looper对象是否存在。因此，在一个普通的线程中要想使用Handler，必须现调用Looper#prepare，Android应用的主线程，已经调用了Looper#prepare
-
-#### Looper#prepare
-
-```java
-    public static void prepare() {
-        prepare(true);
-    }
-
-	static final ThreadLocal<Looper> sThreadLocal = new ThreadLocal<Looper>();
-
-    private static void prepare(boolean quitAllowed) {
-        if (sThreadLocal.get() != null) {
-            throw new RuntimeException("Only one Looper may be created per thread");
-        }
-        sThreadLocal.set(new Looper(quitAllowed));
-    }
-
-```
-
-prepare的作用就是创建一个Looper对象，并存放到当前线程的sThreadLocal当中。prepare方法只允许调用一次，若`sThreadLocal.get() != null`，则会抛出异常。
-
-#### Looper#init
-
-```java
-    private Looper(boolean quitAllowed) {
-        mQueue = new MessageQueue(quitAllowed);
-        mThread = Thread.currentThread();
-    }
-```
-
-Looper的构造器中，创建了MessageQueue对象以及获取了当前的线程Thread对象作为自己的成员变量mQueue和mThread
-
-#### Looper#loop
-
-```java
-    public static void loop() {
-        //myLooper()会从sThreadLocal中取出Looper对象
-        final Looper me = myLooper();
-        if (me == null) {
-            throw new RuntimeException("No Looper; Looper.prepare() wasn't called on this thread.");
-        }
-        //获取Looper中的MessageQueue对象
-        final MessageQueue queue = me.mQueue;
-		......
-        for (;;) { //进入loop循环，是一个死循环
-            //获取消息队列中的消息，可能会阻塞
-            Message msg = queue.next();
-            if (msg == null) {
-                return;
-            }
-            try {
-                //分发消息
-                msg.target.dispatchMessage(msg);
-            } finally {
-                ......
-            }
-           //回收消息
-            msg.recycleUnchecked();
-        }
-    }
-```
-
-Looper#loop方法使当前线程进入死循环当中，不断从MessageQueue当中取出Message，并通过Message.target分发消息，最后回收Message，直到取出的Message为null。
-
-
-
-#### Handler#sendMessage
-
-```java
-    public final boolean sendMessage(@NonNull Message msg) {
-        return sendMessageDelayed(msg, 0);
-    }
-    
-    public final boolean sendMessageDelayed(@NonNull Message msg, long delayMillis) {
-        if (delayMillis < 0) {
-            delayMillis = 0;
-        }
-        //这里传入的时间为开机到当前的时间（不包括系统休眠的时间）+ 设置的延时时间
-        return sendMessageAtTime(msg, SystemClock.uptimeMillis() + delayMillis);
-    }
-
-    public boolean sendMessageAtTime(@NonNull Message msg, long uptimeMillis) {
-        MessageQueue queue = mQueue;
-        if (queue == null) {
-            RuntimeException e = new RuntimeException(
-                    this + " sendMessageAtTime() called with no mQueue");
-            Log.w("Looper", e.getMessage(), e);
-            return false;
-        }
-        return enqueueMessage(queue, msg, uptimeMillis);
-    }
-```
-
-##### Handler#enqueueMessage
-
-```java
-    private boolean enqueueMessage(@NonNull MessageQueue queue, @NonNull Message msg,
-            long uptimeMillis) {
-        //设置要发送的Message的target为当前的Handler
-        msg.target = this;
-        msg.workSourceUid = ThreadLocalWorkSource.getUid();
-
-        if (mAsynchronous) {
-            msg.setAsynchronous(true);
-        }
-        //调用MessageQueue#enqueueMessage
-        return queue.enqueueMessage(msg, uptimeMillis);
-    }
-
-```
-
-
-
-#### MessageQueue#enqueueMessage
-
-```java
-    boolean enqueueMessage(Message msg, long when) {
-        if (msg.target == null) {
-            throw new IllegalArgumentException("Message must have a target.");
-        }
-        if (msg.isInUse()) {
-            throw new IllegalStateException(msg + " This message is already in use.");
-        }
-
-        synchronized (this) {
-            if (mQuitting) {
-                //如果正在关闭，则释放Message
-                msg.recycle();
-                return false;
-            }
-            msg.markInUse();
-            msg.when = when;
-            Message p = mMessages;//获取MessageQueue持有的Message队列的头
-            boolean needWake;
-            if (p == null || when == 0 || when < p.when) {
-                // 若当前的消息队列的头为null，或者执行时间为0，或者执行时间要比消息头的执行时间早
-                // 设置新的消息队列的头
-                msg.next = p;
-                mMessages = msg;
-                //mBlocked表示是否是阻塞状态，若是，则下面需要唤醒底层的eventfd
-                needWake = mBlocked;
-            } else {
-				//否则加入消息队列的尾部
-                needWake = mBlocked && p.target == null && msg.isAsynchronous();
-                Message prev;
-                for (;;) {
-                    prev = p;
-                    p = p.next;
-                    if (p == null || when < p.when) {
-                        break;
-                    }
-                    if (needWake && p.isAsynchronous()) {
-                        needWake = false;
-                    }
-                }
-                msg.next = p; // invariant: p == prev.next
-                prev.next = msg;
-            }
-			//发送事件
-            if (needWake) {
-                nativeWake(mPtr);
-            }
-        }
-        return true;
-    }
-
-```
-
-#### MessageQueue#init
-
-首先看MessageQueue的构造方法：
-
-```java
-    MessageQueue(boolean quitAllowed) {
-        mQuitAllowed = quitAllowed;
-        mPtr = nativeInit();
-    }
-```
-
-MessageQueue的构造方法中调用了native方法nativeInit
 
 ```c++
 //framework/base/core/jni/android_os_MessageQueue.cpp
@@ -255,12 +30,9 @@ static jlong android_os_MessageQueue_nativeInit(JNIEnv* env, jclass clazz) {
     //将nativeMessageQueue指针转化为jlong类型返回给Java层，即返回NativeMessageQueue的地址
     return reinterpret_cast<jlong>(nativeMessageQueue);
 }
-
 ```
 
-小结：MessageQueue的构造方法通过调用nativeInit native方法创建了NativeMessageQueue对象，并得到了它的指针地址。
 
-##### NativeMessageQueue
 
 ```c++
 //framework/base/core/jni/android_os_MessageQueue.cpp
@@ -305,7 +77,7 @@ NativeMessageQueue的构造函数获取尝试从线程局部变量TLS中获取Lo
 
 注：TLS，(Thread Local Storage 线程局部变量)，多个线程共用一个key，线程只能访问自己的值
 
-##### native Looper
+
 
 我们再来看到native Looper的构造方法
 
@@ -355,112 +127,12 @@ void Looper::rebuildEpollLocked() {
         }
     }
 }
-
-
-```
-
-
-
-
-
-#### MessageQueue#next
-
-回到Java层，上文说到Looper#loop方法会循环调用MessageQueue#next方法
-
-```java
-Message next() {
-    final long ptr = mPtr;
-    if (ptr == 0) {
-        return null;
-    }
-	//等待中的闲时执行的Handler的数量，初始值为-1
-    int pendingIdleHandlerCount = -1;
-    int nextPollTimeoutMillis = 0;
-    for (;;) {
-        if (nextPollTimeoutMillis != 0) {
-            Binder.flushPendingCommands();
-        }
-		//调用native方法nativePollOnce，并传入NativeMessageQueue的地址ptr
-        nativePollOnce(ptr, nextPollTimeoutMillis);
-
-        synchronized (this) {
-            final long now = SystemClock.uptimeMillis();
-            Message prevMsg = null;
-            Message msg = mMessages;
-            if (msg != null && msg.target == null) {
-                do {
-                    prevMsg = msg;
-                    msg = msg.next;
-                } while (msg != null && !msg.isAsynchronous());
-            }
-            if (msg != null) {
-                if (now < msg.when) {
-                    nextPollTimeoutMillis = (int) Math.min(msg.when - now, Integer.MAX_VALUE);
-                } else {
-                    mBlocked = false;
-                    if (prevMsg != null) {
-                        prevMsg.next = msg.next;
-                    } else {
-                        mMessages = msg.next;
-                    }
-                    msg.next = null;
-                    if (DEBUG) Log.v(TAG, "Returning message: " + msg);
-                    msg.markInUse();
-                    return msg;
-                }
-            } else {
-                nextPollTimeoutMillis = -1;
-            }
-            if (mQuitting) {
-                dispose();
-                return null;
-            }
-            if (pendingIdleHandlerCount < 0
-                    && (mMessages == null || now < mMessages.when)) {
-                pendingIdleHandlerCount = mIdleHandlers.size();
-            }
-            if (pendingIdleHandlerCount <= 0) {
-                mBlocked = true;
-                continue;
-            }
-
-            if (mPendingIdleHandlers == null) {
-                mPendingIdleHandlers = new IdleHandler[Math.max(pendingIdleHandlerCount, 4)];
-            }
-            mPendingIdleHandlers = mIdleHandlers.toArray(mPendingIdleHandlers);
-        }
-        for (int i = 0; i < pendingIdleHandlerCount; i++) {
-            final IdleHandler idler = mPendingIdleHandlers[i];
-            mPendingIdleHandlers[i] = null; // 释放数组中的引用
-
-            boolean keep = false;
-            try {
-                keep = idler.queueIdle();
-            } catch (Throwable t) {
-                Log.wtf(TAG, "IdleHandler threw exception", t);
-            }
-
-            if (!keep) {
-                synchronized (this) {
-                    mIdleHandlers.remove(idler);
-                }
-            }
-        }
-
-        // Reset the idle handler count to 0 so we do not run them again.
-        pendingIdleHandlerCount = 0;
-
-        // While calling an idle handler, a new message could have been delivered
-        // so go back and look again for a pending message without waiting.
-        nextPollTimeoutMillis = 0;
-    }
-}
 ```
 
 
 
 ```c++
-//framework/base/core/jni/android_os_MessageQueue.cpp
+/framework/base/core/jni/android_os_MessageQueue.cpp
 static void android_os_MessageQueue_nativePollOnce(JNIEnv* env, jobject obj,
         jlong ptr, jint timeoutMillis) {
     //通过NativeMessageQueue的地址转换回指针
@@ -685,26 +357,4 @@ Done: ;
 }
 
 ```
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 

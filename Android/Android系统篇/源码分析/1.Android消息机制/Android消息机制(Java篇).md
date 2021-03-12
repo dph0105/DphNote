@@ -19,9 +19,13 @@ Android的消息机制是Android的一个重要的功能，它属于进程内部
 
 Android的消息机制是Android进程内，即线程间的一种通讯方式。它可以用于使任务延迟执行或者是改变任务执行的线程。
 
-Android的消息机制通过[Handler#sendMessage](#2.1 sendMessage)或者[Handler#post](#2.2 post)发送一个Message，通过[MessageQueue#enqueueMessage](#2. enqueueMessage)将Message加入到消息队列中，最终通过 [Handler#dispatchMessage](#1. dispatchMessage)分发任务交给Handler#handleMessage或Handler#handleCallback到Handler所在的线程执行。
+使用Handler的前提是需要线程中存在Looper，即必须在普通线程中调用[Looper#prepare](#2. prepare)创建线程中的Looper，并且调用[Looper#loop](#3. loop)开启消息循环，而在Android主线程中，或者HandlerThread中已经调用了这两个方法。Looper#loop方法会开启一个死循环，不断调用[MessageQueue#next](#3. next)方法，next方法同样会进入一个死循环中，不断调用nativePollOnce，nativePollOnce是一个JNI方法，它会进入阻塞状态，直到超时或者被` nativeWake`方法唤醒。当被唤醒之后，若MessageQueue被设置同步屏障，则取异步消息，否则取同步消息（即普通的消息）。若没有消息则进入下一次循环重新阻塞，若有消息，判断是否到了执行的时间，可以执行则直接返回跳出循环。若还没有可以执行，则设置阻塞超时时间，进入下一次循环。在进入下一次循环之前，首先会判断是否有闲时任务的存在，若不存在，则直接进入next的下一次循环；若存在，则遍历调用IdleHandler#queueIdle方法进行处理，并设置nativePollOnce的超时时间为0，即不阻塞，并进入next的下一次循环。
 
-使用Handler的前提是需要线程中存在Looper，即必须在普通线程中调用[Looper#prepare](#2. prepare)创建线程中的Looper，并且调用[Looper#loop](#3. loop)开启消息循环，而在Android主线程中，或者HandlerThread中已经调用了这两个方法。Looper#loop方法会开启一个死循环，不断调用[MessageQueue#next](#3. next)方法，next方法在没有消息时会阻塞，直到发送消息后被唤醒。
+Handler通过[Handler#sendMessage](#2.1 sendMessage)或者[Handler#post](#2.2 post)发送一个Message，在Handler#enqueueMessage方法中会设置Message的target为当前的Handle。然后调用[MessageQueue#enqueueMessage](#2. enqueueMessage)将Message按照执行时间排序加入到消息队列中，然后调用` nativeWake(mPtr)`唤醒 MessageQueue#next死循环中阻塞的nativePollOnce。
+
+Looper#loop的循环中获取到了Message后最终通过Message.target即发送Message的Handler的 [Handler#dispatchMessage](#1. dispatchMessage)方法分发任务交给Handler#handleMessage或Handler#handleCallback到Handler所在的线程执行。
+
+
 
 
 
@@ -448,7 +452,7 @@ boolean enqueueMessage(Message msg, long when) {
             msg.next = p; // invariant: p == prev.next
             prev.next = msg;
         }
-		//唤醒底层的NativeMessageQueue
+		//唤醒nativePollOnce
         if (needWake) {
             nativeWake(mPtr);
         }
@@ -456,6 +460,16 @@ boolean enqueueMessage(Message msg, long when) {
     return true;
 }
 ```
+
+enqueueMessage方法将Message加入到消息队列中，并判断了是否唤醒在next方法中阻塞的nativePollOnce方法。
+
+若消息的执行时间小于当前消息头的时间，则设置该消息为新的消息头；否则，消息的执行时间顺序添加消息
+
+**是否唤醒阻塞nativePollOnce方法的判断：**
+
+若是新的消息头，并当前为阻塞状态，则唤醒（为新的消息头说明需要马上处理）
+
+若不是消息头，则需要同时满足，当前状态为阻塞状态，且设置了同步屏障，并且新加的消息为异步消息（按顺序加入队列本来应该不用唤醒，但是若是设置了同步屏障，需要优先处理异步消息，所以这时候要唤醒。）
 
 ##### 3. next
 
@@ -546,7 +560,7 @@ Message next() {
             } catch (Throwable t) {
                 Log.wtf(TAG, "IdleHandler threw exception", t);
             }
-			queueIdle返回true时，则不移除闲时任务，返回false，则移除
+			//queueIdle返回true时，则不移除闲时任务，返回false，则移除
             if (!keep) {
                 synchronized (this) {
                     mIdleHandlers.remove(idler);
@@ -563,6 +577,21 @@ Message next() {
 
 next方法可以说Android消息机制最核心的方法了。
 
-next方法会通过死循环来获取消息，首先调用nativePollOnce进入阻塞状态，一开始的nextPollTimeoutMillis为0，即马上超时被唤醒，直到没有消息时，或者设置了同步屏障时会将nextPollTimeoutMillis设为-1，即一直沉睡。而在上一小节[MessageQueue#enqueueMessage](#2. enqueueMessage)方法中，向消息队列加入消息后，最后会调用nativeWake方法唤醒nativePollOnce。
+next方法会通过死循环来获取消息，首先调用nativePollOnce进入阻塞状态，一开始的nextPollTimeoutMillis为0，即马上超时被唤醒
 
-然后next方法处理了Android的同步屏障，拦下同步消息，放行异步消息。若有消息则返回，若无消息，则处理空闲任务，完成一次循环
+ 1. 此时若没有消息（即mMessage == null），则设置nextPollTimeoutMillis为-1，当下一次循环调用nativePollOnce时，就会一直阻塞，直到被唤醒（在上一小节[MessageQueue#enqueueMessage](#2. enqueueMessage)方法中，向消息队列加入消息后，最后会调用nativeWake方法唤醒nativePollOnce）。
+
+ 2. 若有消息首先会判断是否存在同步屏障
+
+     	1. 若有同步屏障，即MessageQueue的mMessage.target==null，此时会遍历消息队列，若存在异步消息，则取该消息，若不存在，就设置nextPollTimeoutMillis为-1
+     	2. 若不存在同步屏障则直接使用该Message。
+
+    得到Message之后，首先判断Message是否可以执行了，即Message.when 是否大于**当前时间 now**，若大于，则设置MessageQueue新的队列头部为下一条消息，**并且next方法返回该Message**。否则设置nextPollTimeoutMillis为Message.when - now，即下一次超时唤醒的时间。
+
+若没有消息返回则会处理IdleHandler，即闲时任务。
+
+若闲时任务数量不大于0，即没有闲时任务时，进入下一次循环。
+
+否则就会循环调用IdleHandler#queueIdle，执行闲时任务，queueIdle返回true时，则不移除闲时任务，返回false，则移除。
+
+当处理完闲时任务，此时可能过去了一段时间，可能已经有一下个Message准备好了，所以设置nextPollTimeoutMillis为0，下一次循环调用nativePollOnce直接超时唤醒，不阻塞。
