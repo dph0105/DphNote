@@ -1,0 +1,14 @@
+使用OkHttp执行网络请求，主要过程就是创建OkHttpClient，创建请求Request，通过OkHttpClient的newCall方法，得到一个Call，然后调用它的execute执行同步请求或者enqueue执行异步请求。
+
+无论是execute还是enqueue，都会通过Dispatcher来调度执行，Dispatcher设置了最多存在64个请求，每个host最多5个请求，异步请求会通过线程池执行，同步请求和异步请求最终都会调用getResponseWithInterceptorChain()方法，这个方法就是通过责任链模式，一个一个拦截器的去执行请求。
+
+1. 首先是我们自定义的通过addInterceptor方法设置的拦截器，可以设置一些公共参数，请求头等
+2. RetryAndFollowUpInterceptor ，根据下面的拦截器返回的Response判断是否执行重试或者重定向
+3. BridgeInterceptor，是对网络请求的封装，处理Request的请求头和Response的返回头
+4. CacheInterceptor，处理缓存
+5. ConnectInterceptro，负责建立连接，它会从ConnectionPool中复用或者创建连接
+6. 用户自定义的networkInterceptor，这个拦截器可以看到请求和响应数据，可以做一些网络调试
+7. CallServerInterceptor，进行请求。
+
+
+
